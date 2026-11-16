@@ -1,0 +1,6 @@
+﻿{
+  "TargetPattern": "VID_1A2C&PID_95F4",
+  "DebounceThresholdMs": 40,
+  "StartWithWindows": true,
+  "MinimizeToTrayOnClose": true
+}

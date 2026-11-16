@@ -1,0 +1,23 @@
+# Binaries and executables
+*.exe
+*.dll
+*.pdb
+
+# Runtime logs and cache
+*.log
+debounce.log
+crash.log
+main_trace.log
+status.json
+
+# Visual Studio / Rider / JetBrains files
+.vs/
+*.user
+*.suo
+bin/
+obj/
+
+# Temporary / OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
