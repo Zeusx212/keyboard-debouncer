@@ -383,6 +383,11 @@ class KeyboardDebouncer:
         if flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED):
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+        # 2. Never block modifier & system keys (Shift, Ctrl, Alt, Win, Caps, etc.)
+        # Blocking modifier keys risks leaving them permanently stuck down in Windows!
+        if vk in (0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5B, 0x5C, 0x14, 0x90, 0x91, 0x5D, 0x13, 0x2C):
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
         now = time.perf_counter()
         is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
         is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
@@ -395,7 +400,7 @@ class KeyboardDebouncer:
                 rec = KeyRecord(vk)
                 self.key_records[vk] = rec
 
-            # 2. If this key belongs to another device (e.g. secondary keyboard, macro pad): NEVER BLOCK!
+            # 3. If this key belongs to another device (e.g. secondary keyboard, macro pad): NEVER BLOCK!
             if rec.is_target_device is False:
                 if is_down:
                     rec.last_hook_down = now
@@ -403,18 +408,17 @@ class KeyboardDebouncer:
                     rec.last_hook_up = now
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # 3. Target Keyboard Debounce Logic:
+            # 4. Target Keyboard Debounce Logic:
             if is_down:
                 # Check A: Release bounce (Break bounce)
                 # Switch was released, but contact chatters closed within < threshold
                 time_since_up = now - rec.last_hook_up
                 if 0.0 < time_since_up < threshold_s:
-                    rec.suppressed_down = True
                     rec.bounce_count += 1
                     self.total_blocked += 1
                     key_name = get_vk_name(vk)
                     self.log(f"[BLOCKED] Bounced KeyDown: '{key_name}' (VK 0x{vk:02X}) occurred {time_since_up*1000:.1f}ms after release (threshold: {threshold_ms}ms) on target keyboard")
-                    return 1  # DROP BOUNCE
+                    return 1  # DROP SPURIOUS BOUNCE
 
                 # Check B: Make bounce (rapid flutter without human release)
                 time_since_down = now - rec.last_hook_down
@@ -422,15 +426,13 @@ class KeyboardDebouncer:
                 if rec.is_down and 0.0 < time_since_down < threshold_s:
                     # Typematic autorepeat never begins under 200ms
                     if time_since_first < 0.200:
-                        rec.suppressed_down = True
                         rec.bounce_count += 1
                         self.total_blocked += 1
                         key_name = get_vk_name(vk)
                         self.log(f"[BLOCKED] Bounced KeyDown: '{key_name}' (VK 0x{vk:02X}) fluttered {time_since_down*1000:.1f}ms after initial press (threshold: {threshold_ms}ms) on target keyboard")
-                        return 1  # DROP BOUNCE
+                        return 1  # DROP SPURIOUS BOUNCE
 
                 # Legitimate KeyDown
-                rec.suppressed_down = False
                 if not rec.is_down or (now - rec.last_hook_down > 0.150):
                     rec.initial_down_time = now
                 rec.last_hook_down = now
@@ -439,20 +441,10 @@ class KeyboardDebouncer:
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             elif is_up:
-                # If the preceding KeyDown was dropped as a bounce, drop this bounce's KeyUp too
-                if rec.suppressed_down:
-                    rec.suppressed_down = False
-                    return 1
-
-                # Spurious micro-release flutter on make: KeyUp occurring < 20ms after KeyDown
-                time_since_down = now - rec.last_hook_down
-                if 0.0 < time_since_down < min(0.020, threshold_s * 0.4):
-                    rec.suppressed_up = True
-                    return 1  # Suppress contact chatter release so key hold isn't broken
-
-                rec.suppressed_up = False
                 rec.last_hook_up = now
                 rec.is_down = False
+                # CRITICAL: NEVER DROP KEY-UP!
+                # Dropping Key-Up leaves the key permanently STUCK DOWN in the OS.
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         return user32.CallNextHookEx(None, nCode, wParam, lParam)

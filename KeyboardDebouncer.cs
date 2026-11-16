@@ -88,6 +88,17 @@ namespace KeyboardDebouncerApp
         [DllImport("user32.dll")]
         public static extern bool SetProcessDPIAware();
 
+        public const uint KEYEVENTF_KEYUP = 0x0002;
+
+        [DllImport("user32.dll")]
+        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll")]
+        public static extern short GetKeyState(int vKey);
+
         [StructLayout(LayoutKind.Sequential)]
         public struct RAWINPUTDEVICELIST
         {
@@ -268,6 +279,8 @@ namespace KeyboardDebouncerApp
 
         public void Start()
         {
+            EmergencyUnstickKeys();
+
             try
             {
                 IntPtr hDesk = NativeMethods.OpenDesktop("Default", 0, false, 0x01FF);
@@ -281,6 +294,35 @@ namespace KeyboardDebouncerApp
             sinkWindow = new RawInputSinkWindow(this);
             RefreshDevices();
             InstallHook();
+        }
+
+        public void EmergencyUnstickKeys()
+        {
+            byte[] keys = new byte[] {
+                0x10, 0xA0, 0xA1, // Shift, LShift, RShift
+                0x11, 0xA2, 0xA3, // Ctrl, LCtrl, RCtrl
+                0x12, 0xA4, 0xA5, // Alt, LAlt, RAlt
+                0x5B, 0x5C,       // LWin, RWin
+                0x08, 0x09, 0x0D, 0x1B, 0x20 // Backspace, Tab, Enter, Esc, Space
+            };
+            foreach (byte vk in keys)
+            {
+                try
+                {
+                    if ((NativeMethods.GetAsyncKeyState(vk) & 0x8000) != 0 || (NativeMethods.GetKeyState(vk) & 0x8000) != 0)
+                    {
+                        NativeMethods.keybd_event(vk, 0, NativeMethods.KEYEVENTF_KEYUP, UIntPtr.Zero);
+                    }
+                }
+                catch { }
+            }
+            lock (EngineLock)
+            {
+                foreach (var rec in KeyRecords.Values)
+                {
+                    rec.IsDown = false;
+                }
+            }
         }
 
         public void Stop()
@@ -475,6 +517,33 @@ namespace KeyboardDebouncerApp
             }
         }
 
+        public static bool IsModifierOrSystemKey(uint vk)
+        {
+            switch (vk)
+            {
+                case 0x10: // VK_SHIFT
+                case 0xA0: // VK_LSHIFT
+                case 0xA1: // VK_RSHIFT
+                case 0x11: // VK_CONTROL
+                case 0xA2: // VK_LCONTROL
+                case 0xA3: // VK_RCONTROL
+                case 0x12: // VK_MENU (Alt)
+                case 0xA4: // VK_LMENU
+                case 0xA5: // VK_RMENU
+                case 0x5B: // VK_LWIN
+                case 0x5C: // VK_RWIN
+                case 0x14: // VK_CAPITAL (Caps Lock)
+                case 0x90: // VK_NUMLOCK
+                case 0x91: // VK_SCROLL
+                case 0x5D: // VK_APPS
+                case 0x13: // VK_PAUSE
+                case 0x2C: // VK_SNAPSHOT (Print Screen)
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0 && IsActive)
@@ -483,8 +552,15 @@ namespace KeyboardDebouncerApp
                 uint vk = kb.vkCode;
                 uint flags = kb.flags;
 
-                // Never block injected inputs (software macros, on-screen keyboard, remote desktop)
+                // 1. Never block injected inputs (software macros, on-screen keyboard, remote desktop)
                 if ((flags & (NativeMethods.LLKHF_INJECTED | NativeMethods.LLKHF_LOWER_IL_INJECTED)) != 0)
+                {
+                    return NativeMethods.CallNextHookEx(hookHandle, nCode, wParam, lParam);
+                }
+
+                // 2. Modifier & system keys MUST NEVER be blocked!
+                // Blocking modifier keys causes them to get stuck down in Windows, paralyzing typing.
+                if (IsModifierOrSystemKey(vk))
                 {
                     return NativeMethods.CallNextHookEx(hookHandle, nCode, wParam, lParam);
                 }
@@ -505,7 +581,7 @@ namespace KeyboardDebouncerApp
                         KeyRecords[(ushort)vk] = rec;
                     }
 
-                    // If key belongs to another device (e.g. secondary keyboard, mouse, macro pad): NEVER BLOCK!
+                    // 3. If key belongs to another device (e.g. secondary keyboard, mouse, macro pad): NEVER BLOCK!
                     if (rec.IsTargetDevice == false)
                     {
                         if (isDown) rec.LastHookDown = now;
@@ -513,37 +589,34 @@ namespace KeyboardDebouncerApp
                         return NativeMethods.CallNextHookEx(hookHandle, nCode, wParam, lParam);
                     }
 
-                    // Target Keyboard Debounce Logic
+                    // 4. Target Keyboard Debounce Logic
                     if (isDown)
                     {
-                        // Check A: Release bounce (Break bounce)
+                        // Check A: Release bounce (contact chatter reconnect upon key release)
                         double timeSinceUp = now - rec.LastHookUp;
                         if (rec.LastHookUp > 0 && timeSinceUp > 0.0 && timeSinceUp < thresholdSec)
                         {
-                            rec.SuppressedDown = true;
                             rec.BounceCount++;
                             TotalBlocked++;
                             NotifyBounceBlocked((ushort)vk, "Release bounce", timeSinceUp * 1000.0);
-                            return (IntPtr)1; // DROP BOUNCE
+                            return (IntPtr)1; // DROP SPURIOUS BOUNCE
                         }
 
-                        // Check B: Make bounce (contact flutter on press)
+                        // Check B: Make bounce (contact chatter flutter while pressing down)
                         double timeSinceDown = now - rec.LastHookDown;
                         double timeSinceFirst = now - rec.InitialDownTime;
                         if (rec.IsDown && rec.LastHookDown > 0 && timeSinceDown > 0.0 && timeSinceDown < thresholdSec)
                         {
-                            if (timeSinceFirst < 0.200) // Not typematic repeat
+                            if (timeSinceFirst < 0.200) // Not typematic autorepeat
                             {
-                                rec.SuppressedDown = true;
                                 rec.BounceCount++;
                                 TotalBlocked++;
                                 NotifyBounceBlocked((ushort)vk, "Make bounce", timeSinceDown * 1000.0);
-                                return (IntPtr)1; // DROP BOUNCE
+                                return (IntPtr)1; // DROP SPURIOUS BOUNCE
                             }
                         }
 
-                        // Normal KeyDown
-                        rec.SuppressedDown = false;
+                        // Legitimate KeyDown
                         if (!rec.IsDown || (now - rec.LastHookDown > 0.150))
                         {
                             rec.InitialDownTime = now;
@@ -554,24 +627,11 @@ namespace KeyboardDebouncerApp
                     }
                     else if (isUp)
                     {
-                        // Drop matching KeyUp if KeyDown was dropped as a bounce
-                        if (rec.SuppressedDown)
-                        {
-                            rec.SuppressedDown = false;
-                            return (IntPtr)1;
-                        }
-
-                        // Suppress spurious micro-release flutter on make (< 20ms)
-                        double timeSinceDown = now - rec.LastHookDown;
-                        if (timeSinceDown > 0.0 && timeSinceDown < Math.Min(0.020, thresholdSec * 0.4))
-                        {
-                            rec.SuppressedUp = true;
-                            return (IntPtr)1; // Suppress contact chatter release
-                        }
-
-                        rec.SuppressedUp = false;
                         rec.LastHookUp = now;
                         rec.IsDown = false;
+                        // CRITICAL: NEVER DROP KEY-UP!
+                        // In Windows, an extra KeyUp on an already-up key is a harmless no-op,
+                        // but dropping a KeyUp leaves the key permanently STUCK DOWN in the OS.
                         return NativeMethods.CallNextHookEx(hookHandle, nCode, wParam, lParam);
                     }
                 }
@@ -1148,13 +1208,28 @@ namespace KeyboardDebouncerApp
             btnResetStats = new Button
             {
                 Text = "Reset Counters",
-                Location = new Point(470, 70),
-                Size = new Size(134, 28),
+                Location = new Point(470, 68),
+                Size = new Size(134, 26),
                 Font = new Font("Segoe UI", 8.5F),
                 BackColor = Color.White,
                 FlatStyle = FlatStyle.System
             };
             btnResetStats.Click += (s, e) => engine.ResetStats();
+
+            Button btnUnstick = new Button
+            {
+                Text = "Unstick All Keys",
+                Location = new Point(470, 98),
+                Size = new Size(134, 26),
+                Font = new Font("Segoe UI", 8.5F),
+                BackColor = Color.White,
+                FlatStyle = FlatStyle.System
+            };
+            btnUnstick.Click += (s, e) =>
+            {
+                engine.EmergencyUnstickKeys();
+                MessageBox.Show("All keys and modifiers (Shift, Ctrl, Alt, Win) have been released in Windows.", "Emergency Unstick", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
 
             lblTopBounced = new Label
             {
@@ -1172,6 +1247,7 @@ namespace KeyboardDebouncerApp
             cardStatus.Controls.Add(lblStatsTotal);
             cardStatus.Controls.Add(lblStatsBlocked);
             cardStatus.Controls.Add(btnResetStats);
+            cardStatus.Controls.Add(btnUnstick);
             cardStatus.Controls.Add(lblTopBounced);
             pnlBody.Controls.Add(cardStatus);
 
@@ -1281,6 +1357,7 @@ namespace KeyboardDebouncerApp
         public void ToggleProtection()
         {
             engine.IsActive = !engine.IsActive;
+            engine.EmergencyUnstickKeys();
             if (engine.IsActive)
             {
                 lblStatusBadge.Text = "● ACTIVE - Protecting against key bounce";
